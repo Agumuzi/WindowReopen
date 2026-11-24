@@ -1,0 +1,12 @@
+.DS_Store
+.AppleDouble
+._*
+.build/
+.swiftpm/
+build/
+DerivedData/
+window-reopen
+*.dSYM/
+*.log
+.env
+.env.*
