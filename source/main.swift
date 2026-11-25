@@ -5,10 +5,24 @@ import AppKit
 import CoreGraphics
 import os
 
-private let version = "1.1.0"
+private let version = "1.1.1"
 private let log = Logger(subsystem: "local.windowreopen", category: "service")
 
 private final class WindowReopen {
+    private enum Timing {
+        static let initialReopenDelay: TimeInterval = 0.20
+        static let reopenConfirmationDelay: TimeInterval = 0.12
+        static let recentLaunchSuppression: TimeInterval = 0.90
+        static let reopenRequestSuppression: TimeInterval = 0.30
+        static let reopenCandidateLifetime: TimeInterval = 1.20
+        static let reopenSpaceSettling: TimeInterval = 0.30
+        static let foregroundSampleInterval: TimeInterval = 0.15
+        static let handoffSpaceSettling: TimeInterval = 0.45
+        static let handoffActivationLifetime: TimeInterval = 1.00
+    }
+
+    private static let requiredMissingWindowSamples = 2
+    private static let finderBundleID = "com.apple.finder"
     private static let excludedBundleIDs: Set<String> = [
         "com.apple.dock", "com.apple.spotlight", "com.apple.notificationcenterui",
         "com.apple.controlcenter", "com.apple.loginwindow", "com.apple.securityagent",
@@ -26,7 +40,7 @@ private final class WindowReopen {
     private var foregroundTimer: Timer?
     private var foregroundApplication: NSRunningApplication?
     private var sawForegroundWindow = false
-    private var missingWindowSince: TimeInterval?
+    private var missingWindowSamples = 0
     private var handoffActivation: (pid: pid_t, expiresAt: TimeInterval)?
 
     private var uptime: TimeInterval { ProcessInfo.processInfo.systemUptime }
@@ -87,15 +101,16 @@ private final class WindowReopen {
         observeForeground(sessionIsActive ? app : nil)
 
         guard sessionIsActive, !fromHandoff, !sawForegroundWindow, NSEvent.pressedMouseButtons == 0,
-              Self.isSupportedApplication(app), app.isFinishedLaunching,
+              Self.isEligibleForReopen(app),
               (suppressUntil[pid] ?? 0) <= now else {
             return
         }
-        if let launchDate = app.launchDate, abs(launchDate.timeIntervalSinceNow) < 0.9 {
+        if let launchDate = app.launchDate, abs(launchDate.timeIntervalSinceNow) < Timing.recentLaunchSuppression {
             return
         }
 
-        schedule(app, after: 0.20, deadline: now + 1.2, missingWindowSample: false)
+        schedule(app, after: Timing.initialReopenDelay, deadline: now + Timing.reopenCandidateLifetime,
+                 missingWindowSample: false)
     }
 
     private func observeCurrentForeground() {
@@ -106,7 +121,7 @@ private final class WindowReopen {
 
     private func observeForeground(_ app: NSRunningApplication?) {
         resetForegroundWindowObservation()
-        guard let app, Self.isSupportedApplication(app) else {
+        guard let app, Self.isEligibleHandoffSource(app) else {
             foregroundApplication = nil
             foregroundTimer?.invalidate()
             foregroundTimer = nil
@@ -114,7 +129,7 @@ private final class WindowReopen {
         }
         foregroundApplication = app
         if foregroundTimer == nil {
-            foregroundTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            foregroundTimer = Timer.scheduledTimer(withTimeInterval: Timing.foregroundSampleInterval, repeats: true) { [weak self] _ in
                 self?.sampleForegroundWindow()
             }
         }
@@ -123,7 +138,7 @@ private final class WindowReopen {
 
     private func resetForegroundWindowObservation() {
         sawForegroundWindow = false
-        missingWindowSince = nil
+        missingWindowSamples = 0
     }
 
     private func sampleForegroundWindow() {
@@ -132,29 +147,25 @@ private final class WindowReopen {
             return
         }
         let now = uptime
-        guard now - lastSpaceChange >= 0.45, let windows = Self.onScreenWindows() else {
-            missingWindowSince = nil
+        guard now - lastSpaceChange >= Timing.handoffSpaceSettling, let windows = Self.onScreenWindows() else {
+            missingWindowSamples = 0
             return
         }
 
         let pid = app.processIdentifier
         if windows.contains(where: { Self.normalWindowOwner($0) == pid }) {
             sawForegroundWindow = true
-            missingWindowSince = nil
+            missingWindowSamples = 0
             cancelPending()
             return
         }
 
-        guard sawForegroundWindow, app.isFinishedLaunching else { return }
-        guard NSEvent.pressedMouseButtons == 0 else {
-            missingWindowSince = nil
+        guard sawForegroundWindow, app.isFinishedLaunching, NSEvent.pressedMouseButtons == 0 else {
+            missingWindowSamples = 0
             return
         }
-        guard let firstMissing = missingWindowSince else {
-            missingWindowSince = now
-            return
-        }
-        guard now - firstMissing >= 0.20 else { return }
+        missingWindowSamples += 1
+        guard missingWindowSamples >= Self.requiredMissingWindowSamples else { return }
 
         resetForegroundWindowObservation()
         handOffForeground(from: app, windows: windows)
@@ -165,14 +176,14 @@ private final class WindowReopen {
         let visibleTarget = windows.lazy.compactMap(Self.normalWindowOwner)
             .filter { $0 != sourcePID }
             .compactMap { NSRunningApplication(processIdentifier: $0) }
-            .first { Self.isSupportedApplication($0) && $0.isFinishedLaunching && !$0.isHidden }
-        let target = visibleTarget ?? NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder")
+            .first(where: Self.isEligibleHandoffTarget)
+        let target = visibleTarget ?? NSRunningApplication.runningApplications(withBundleIdentifier: Self.finderBundleID)
             .first { $0.processIdentifier != sourcePID && !$0.isTerminated }
-        guard let target, isStillFrontmost(source) else { return }
+        guard let target, isStillFrontmost(source), NSEvent.pressedMouseButtons == 0 else { return }
 
         let targetPID = target.processIdentifier
         // Consume the activation once so an empty Finder stays on the desktop.
-        handoffActivation = (targetPID, uptime + 1.0)
+        handoffActivation = (targetPID, uptime + Timing.handoffActivationLifetime)
         let accepted: Bool
         if #available(macOS 14.0, *) {
             accepted = target.activate(from: source, options: []) || target.activate(options: [])
@@ -210,7 +221,7 @@ private final class WindowReopen {
         guard now <= deadline, isStillFrontmost(app), NSEvent.pressedMouseButtons == 0 else { return }
 
         // A Space transition can briefly remove all normal windows from the list.
-        let spaceSettleTime = lastSpaceChange + 0.30 - now
+        let spaceSettleTime = lastSpaceChange + Timing.reopenSpaceSettling - now
         if spaceSettleTime > 0 {
             schedule(app, after: spaceSettleTime, deadline: deadline, missingWindowSample: false)
             return
@@ -224,7 +235,7 @@ private final class WindowReopen {
         let pid = app.processIdentifier
         guard !windows.contains(where: { Self.normalWindowOwner($0) == pid }) else { return }
         if !missingWindowSample {
-            schedule(app, after: 0.12, deadline: deadline, missingWindowSample: true)
+            schedule(app, after: Timing.reopenConfirmationDelay, deadline: deadline, missingWindowSample: true)
             return
         }
 
@@ -234,7 +245,7 @@ private final class WindowReopen {
               isStillFrontmost(app) else { return }
 
         suppressUntil = suppressUntil.filter { $0.value > now }
-        suppressUntil[pid] = now + 1.25
+        suppressUntil[pid] = now + Timing.reopenRequestSuppression
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = false
         configuration.createsNewApplicationInstance = false
@@ -261,6 +272,19 @@ private final class WindowReopen {
         guard app.activationPolicy == .regular, !app.isTerminated,
               let bundleID = app.bundleIdentifier?.lowercased() else { return false }
         return !excludedBundleIDs.contains(bundleID) && !bundleID.contains(".helper") && !bundleID.hasSuffix("helper")
+    }
+
+    // Finder also owns the desktop. Its activation can mean a desktop click.
+    private static func isEligibleForReopen(_ app: NSRunningApplication) -> Bool {
+        isSupportedApplication(app) && app.isFinishedLaunching && app.bundleIdentifier?.lowercased() != finderBundleID
+    }
+
+    private static func isEligibleHandoffSource(_ app: NSRunningApplication) -> Bool {
+        isSupportedApplication(app) && app.bundleIdentifier?.lowercased() != finderBundleID
+    }
+
+    private static func isEligibleHandoffTarget(_ app: NSRunningApplication) -> Bool {
+        isSupportedApplication(app) && app.isFinishedLaunching && !app.isHidden
     }
 
     private static func onScreenWindows() -> [[String: Any]]? {

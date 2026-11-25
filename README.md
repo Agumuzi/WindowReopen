@@ -17,7 +17,9 @@ WindowReopen runs as a free, MIT-licensed user LaunchAgent. macOS continues to p
 
 The service receives activation notifications from `NSWorkspace` and uses public Core Graphics window metadata to check for onscreen windows. When no normal window is visible after a short delay, it asks Launch Services to reopen the already-running app. It checks for a foreground change before sending the request.
 
-For focus handoff, it samples the current foreground app every 250 ms. It waits for the last visible window to disappear across consecutive samples and uses the onscreen window order to choose the next app. It clears the window observation on a Space transition and skips the reopen check for an activation it requested for handoff.
+For focus handoff, it samples eligible foreground apps every 150 ms. It confirms the disappearance of the last visible window with two consecutive samples and uses the onscreen stacking order to choose the next app. It clears the observation on a Space transition and skips the reopen check for an activation it requested for handoff.
+
+Finder keeps its native desktop, Dock, and Command–Tab behavior. Finder activations do not trigger WindowReopen's reopen logic, and losing the last Finder window does not trigger handoff. Finder remains eligible to receive focus, including when the desktop is empty.
 
 ## Requirements and compatibility
 
@@ -26,7 +28,7 @@ For focus handoff, it samples the current foreground app every 250 ms. It waits 
 - A working Swift toolchain from Xcode or the Xcode Command Line Tools. Check it with `xcrun --find swiftc`.
 - Run the installer from your signed-in macOS GUI session as your regular user.
 
-Tests on that system covered window restoration and reopen, focus handoff with Music and TextEdit, multiple windows, the empty-desktop Finder fallback, and switching between a normal desktop and a fullscreen app. Switching between two ordinary Spaces, physical Dock clicks, and end-to-end verification of the physical Command–Tab shortcut and switcher animations remain unverified. Login startup has been checked through the LaunchAgent configuration and registration.
+On that system, v1.1.1 tests covered window restoration and reopen with AppKit test windows, rapid programmatic switching, multiple windows, Finder window closure and minimization, Finder as a handoff target, the empty-desktop fallback, and a round trip between the ordinary desktop and fullscreen Dictionary. Clicking the bare desktop or Dock, the physical Command–Tab path, and switching between two ordinary Spaces remain unverified. Login startup has been checked through the LaunchAgent configuration and registration.
 
 ## Install from source
 
@@ -86,6 +88,7 @@ It reads window metadata such as ownership, bounds, visibility, and stacking ord
 ## Known limitations
 
 - Activation notifications do not identify the source. Dock, Spotlight, and programmatic activations can also be eligible.
+- Finder activations are excluded from automatic reopen, including when Command–Tab selects Finder without a window.
 - Window metadata does not always distinguish minimized windows from windows outside the current screen or Space. App layouts, fullscreen transitions, and helper windows can affect detection.
 - The target app chooses how to respond to a native reopen request and may ignore it. Handoff activates an app, and macOS and that app determine the exact window receiving focus.
 - An app closing its own last window can trigger handoff, as can a keyboard shortcut. A handoff naturally updates the macOS app switcher's recent-use order.

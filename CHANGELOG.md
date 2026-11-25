@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.1.1 — 2026-11-25
+
+- Keep Finder's native activation behavior. Finder can receive focus but does not trigger automatic reopen or handoff when its last window disappears.
+- Sample foreground windows every 150 ms and confirm window loss with two consecutive samples.
+- Shorten the reopen request suppression window to 300 ms so a quick return can restore a newly minimized window.
+
 ## v1.1.0 — 2026-11-24
 
 First public source release.
